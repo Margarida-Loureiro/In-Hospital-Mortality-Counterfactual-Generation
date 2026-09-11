@@ -463,6 +463,52 @@ def _scaled_frame(reference: pd.DataFrame, center: pd.Series, scale: pd.Series) 
     return reference.sub(center, axis=1).div(denom, axis=1).fillna(0.0)
 
 
+def _infer_decimal_precision(series: pd.Series, max_precision: int = 6) -> int:
+    """Infer how many decimal places this column's values are normally
+    recorded to, mirroring the convention DiCE's own genetic search uses
+    (round_to_precision(), applied to its final output) -- so a range bound
+    can be compared at the same precision the counterfactual value was
+    itself rounded to, rather than against the bound's full float64
+    precision. Without this, a value that legitimately satisfied
+    [train_min, train_max] before DiCE's own final rounding step can appear
+    to fall just outside it afterwards (e.g. a value at exactly 654.36 that
+    DiCE rounds to 654.4 for display, since that column is normally
+    recorded to one decimal place).
+
+    Returns the most common number of decimal places across the column's
+    non-null values (after first rounding to max_precision to strip float64
+    representation noise), defaulting to max_precision if the column is
+    empty.
+    """
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    if vals.empty:
+        return max_precision
+    counts: Dict[int, int] = {}
+    for v in vals:
+        s = f"{float(v):.{max_precision}f}".rstrip("0")
+        n_decimals = len(s.split(".")[1]) if "." in s else 0
+        counts[n_decimals] = counts.get(n_decimals, 0) + 1
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+def _precision_aware_bounds(
+    reference: pd.DataFrame,
+    permitted_range: Dict[str, List[float]],
+) -> Dict[str, List[float]]:
+    """Round each feature's [lo, hi] bound to that feature's own typical
+    decimal precision in `reference` (see _infer_decimal_precision), so a
+    downstream range check is comparing at the same precision DiCE's own
+    round_to_precision() output is expressed at."""
+    rounded: Dict[str, List[float]] = {}
+    for feature, (lo, hi) in permitted_range.items():
+        if feature not in reference.columns:
+            rounded[feature] = [lo, hi]
+            continue
+        precision = _infer_decimal_precision(reference[feature])
+        rounded[feature] = [round(lo, precision), round(hi, precision)]
+    return rounded
+
+
 def _parse_changed_features(raw_value: object) -> List[str]:
     if raw_value is None or (isinstance(raw_value, float) and pd.isna(raw_value)):
         return []
@@ -605,7 +651,13 @@ def evaluate_counterfactuals(
     # Training-range bounds for the quantile-violation check
     # A "violation" is defined as falling outside [train_min, train_max]
     # -- the same range the counterfactual search was itself constrained to
-    plausibility_bounds = get_permitted_range(metadata, plausibility_features)
+    raw_plausibility_bounds = get_permitted_range(metadata, plausibility_features)
+    plausibility_bounds = _precision_aware_bounds(x_reference, raw_plausibility_bounds)
+    plausibility_precisions = {
+        feature: _infer_decimal_precision(x_reference[feature])
+        for feature in plausibility_bounds
+        if feature in x_reference.columns
+    }
 
     evaluated = counterfactuals.copy().reset_index(drop=True)
     changed_feature_lists: List[List[str]] = []
@@ -640,18 +692,17 @@ def evaluate_counterfactuals(
 
         changed_feature_lists.append(changed)
         actionability_violations.append(sum(1 for feature in changed if feature not in mutable_feature_set))
-        quantile_violations.append(
-            sum(
-                1
-                for feature in changed
-                if feature in plausibility_feature_set
-                and feature in plausibility_bounds
-                and (
-                    plaus_cf.iloc[idx][feature] < plausibility_bounds[feature][0]
-                    or plaus_cf.iloc[idx][feature] > plausibility_bounds[feature][1]
-                )
-            )
-        )
+
+        def _is_range_violation(feature: str) -> bool:
+            if feature not in plausibility_feature_set or feature not in plausibility_bounds:
+                return False
+            raw_value = plaus_cf.iloc[idx][feature]
+            precision = plausibility_precisions.get(feature)
+            value = round(float(raw_value), precision) if precision is not None else raw_value
+            lo, hi = plausibility_bounds[feature]
+            return value < lo or value > hi
+
+        quantile_violations.append(sum(1 for feature in changed if _is_range_violation(feature)))
 
     pred_proba_factual = evaluated["pred_proba_factual"].astype(float) if "pred_proba_factual" in evaluated.columns else factuals.set_index("row_id").loc[evaluated["row_id"], "pred_proba"].reset_index(drop=True).astype(float)
     pred_proba_cf = evaluated["pred_proba_counterfactual"].astype(float)
@@ -702,7 +753,3 @@ def evaluate_counterfactuals(
         "threshold_used_for_validity": float(threshold),
     }
     return evaluated, summary
-
-
-
-
