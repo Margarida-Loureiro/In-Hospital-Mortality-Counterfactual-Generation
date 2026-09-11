@@ -16,9 +16,9 @@ PROJECT_DIR = Path(__file__).resolve().parent
 
 @dataclass
 class CFExperimentConfig:
-    data_dir: str = str(PROJECT_DIR / "data" / "processed")
-    model_dir: str = str(PROJECT_DIR / "data" / "model")
-    out_root: str = str(PROJECT_DIR / "results" / "counterfactual_experiments")
+    data_dir: str = str(PROJECT_DIR / "mimic48_processed_csv_final9000")
+    model_dir: str = str(PROJECT_DIR / "xgboost_results_final9000")
+    out_root: str = str(PROJECT_DIR / "counterfactual_experiments")
     random_state: int = 42
     id_columns: Tuple[str, ...] = ("stay_id", "subject_id", "hadm_id")
     target_positive_label: int = 1
@@ -602,8 +602,13 @@ def evaluate_counterfactuals(
     centered_cf = plaus_cf_scaled.to_numpy()
     mahalanobis = np.sqrt(np.einsum("ij,jk,ik->i", centered_cf, cov_inv, centered_cf))
 
-    q01 = plaus_stats["q01"]
-    q99 = plaus_stats["q99"]
+    # Training-range bounds for the quantile-violation check, built with the
+    # exact same helper (get_permitted_range) used to construct the
+    # generation-time permitted_range passed into DiCE, OCEAN, and FACET.
+    # A "violation" is now defined as falling outside [train_min, train_max]
+    # -- the same range the counterfactual search was itself constrained to
+    # -- rather than outside the narrower [q01, q99] band used previously.
+    plausibility_bounds = get_permitted_range(metadata, plausibility_features)
 
     evaluated = counterfactuals.copy().reset_index(drop=True)
     changed_feature_lists: List[List[str]] = []
@@ -643,7 +648,11 @@ def evaluate_counterfactuals(
                 1
                 for feature in changed
                 if feature in plausibility_feature_set
-                and (plaus_cf.iloc[idx][feature] < q01[feature] or plaus_cf.iloc[idx][feature] > q99[feature])
+                and feature in plausibility_bounds
+                and (
+                    plaus_cf.iloc[idx][feature] < plausibility_bounds[feature][0]
+                    or plaus_cf.iloc[idx][feature] > plausibility_bounds[feature][1]
+                )
             )
         )
 
